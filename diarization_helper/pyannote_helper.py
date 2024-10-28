@@ -23,6 +23,8 @@ Authors:
 """
 
 
+from itertools import product
+from collections import OrderedDict  # Corrected import
 import os_helper as osh
 from typing import Any, Dict, Optional
 import audio_helper as ah
@@ -58,6 +60,7 @@ def credentials(config_path: str = None) -> dict:
         "approximated_number_iterations",
         "split_time",
         "min_waiting_time_per_iteration",
+        "max_wait_time",
     ]
     return osh.get_config(keys, "pyannote", config_path)
 
@@ -67,7 +70,8 @@ def pyannote_processing(
     sftp_cred: Dict[str, str],
     pyannote_cred: Dict[str, Any],
     output_file: Optional[str] = None,
-    num_workers: int = 1
+    num_workers: int = 1,
+    overwrite: bool = True
 ) -> str:
     """
     Process transcription with Pyannote API and return the output file path.
@@ -81,9 +85,11 @@ def pyannote_processing(
     pyannote_cred : dict
         Pyannote credentials for API access.
     output_file : str, optional
-        Path to save the transcription result as a JSON file. Defaults to 'pyannote-result.json'.
+        Path to save the transcription result as a JSON file.
     num_workers : int, optional
         Number of workers to use for parallel processing of audio chunks. Defaults to 1.
+    overwrite : bool, optional
+        Whether to overwrite the output file if it already exists. Defaults to True.
 
     Returns
     -------
@@ -110,43 +116,76 @@ def pyannote_processing(
     osh.info(f"Audio duration is {osh.time2str(duration)}")
 
     # Check if output already exists to avoid reprocessing
-    if osh.file_exists(output_file):
+    if osh.file_exists(output_file) and not overwrite:
         osh.info(f"Pyannote processing already done for {sound_path}. Result: {output_file}")
-        return output_file  # Return if the file already exists
+        return output_file  # Return if the file already exists and overwrite is False
+
+    # Determine if we need to split the audio
+    allow_splitting = duration > pyannote_cred["split_time"]
 
     # Handle large files by splitting into chunks
-    if duration > pyannote_cred["split_time"]:
+    if allow_splitting:
         temporary_chunks_folder = f"{folder}/pyannote-chunks"
         osh.make_directory(temporary_chunks_folder)
-        audio_chunks = ah.split_audio_regularly(sound_path, temporary_chunks_folder, pyannote_cred["split_time"] * 0.5)
+        # Use half of the split_time for splitting duration
+        split_duration = pyannote_cred["split_time"] * 0.5
+        audio_chunks = ah.split_audio_regularly(sound_path, temporary_chunks_folder, split_duration)
         osh.info(f"Audio file split into chunks: {', '.join(audio_chunks)}")
         analysis_chunks = []
 
+
         w = min(num_workers, len(audio_chunks))
-        if w <=1:
-            for i, chunk_file in enumerate(audio_chunks):
-                o = f"{temporary_chunks_folder}/pyannote-result-chunk-{i:04d}.json"
-                pyannote_processing(chunk_file, sftp_cred, pyannote_cred, output_file=o, num_workers=1)
-                analysis_chunks.append(o)
+        analysis_chunks = []
+
+        # Prepare output file paths
+        output_files = [f"{temporary_chunks_folder}/pyannote-result-chunk-{i:04d}.json" for i in range(len(audio_chunks))]
+
+        if w <= 1:
+            # Sequential processing
+            for chunk_file, output_file in zip(audio_chunks, output_files):
+                pyannote_processing(
+                    chunk_file,
+                    sftp_cred,
+                    pyannote_cred,
+                    output_file=output_file,
+                    num_workers=1,
+                    overwrite=overwrite
+                )
+                analysis_chunks.append(output_file)
         else:
-            # Parallelize processing of each chunk
+            # Parallel processing
             osh.info(f"Parallelization: {w} workers")
             with ThreadPoolExecutor(max_workers=w) as executor:
-                future_to_chunk = {
-                    executor.submit(pyannote_processing, chunk_file, sftp_cred, pyannote_cred, output_file=f"{temporary_chunks_folder}/pyannote-result-chunk-{i:04d}.json", num_workers = 1): chunk_file
-                    for i, chunk_file in enumerate(audio_chunks)
-                }
+                futures = [
+                    executor.submit(
+                        pyannote_processing,
+                        chunk_file,
+                        sftp_cred,
+                        pyannote_cred,
+                        output_file=output_file,
+                        num_workers=1,
+                        overwrite=overwrite
+                    )
+                    for chunk_file, output_file in zip(audio_chunks, output_files)
+                ]
 
-                for future in as_completed(future_to_chunk):
+                for future, output_file in zip(as_completed(futures), output_files):
                     try:
-                        result_file = future.result()
-                        analysis_chunks.append(result_file)
+                        future.result()
+                        analysis_chunks.append(output_file)
                     except Exception as exc:
-                        osh.error(f"Error processing chunk {future_to_chunk[future]}: {exc}")
+                        osh.error(f"Error processing chunk {output_file}: {exc}")
 
 
-        return _merge_chunk_results(output_file, audio_chunks, analysis_chunks, sftp_cred, pyannote_cred)
-
+        return _merge_chunk_results(
+            output_file,
+            audio_chunks,
+            analysis_chunks,
+            sftp_cred,
+            pyannote_cred,
+            overwrite=overwrite,
+            num_workers=num_workers
+        )
     else:
         if not sftph.remote_file_exists(remote_file, sftp_cred):
             osh.info(f"Uploading {sound_path} to {remote_file}")
@@ -205,15 +244,25 @@ def _poll_for_json_final(
         duration * pyannote_cred["speed_factor"] / pyannote_cred["approximated_number_iterations"],
         pyannote_cred["min_waiting_time_per_iteration"],
     )
-    approximated_number_iterations = round(1 + duration * pyannote_cred["speed_factor"] / waiting_time_per_iteration)
+    approximated_number_iterations = round(
+        1 + duration * pyannote_cred["speed_factor"] / waiting_time_per_iteration
+    )
     counter, total_wait = 0, osh.tic()
-    approximated_waiting_time = osh.time2str(round(1 + approximated_number_iterations * waiting_time_per_iteration))
+    approximated_waiting_time = osh.time2str(
+        round(1 + approximated_number_iterations * waiting_time_per_iteration)
+    )
     dd = osh.time2str(duration)
-    
+
+    max_wait_time = pyannote_cred.get('max_wait_time', 3600)  # Maximum wait time in seconds
     while not sftph.remote_file_exists(remote_json, sftp_cred):
         counter += 1
         tt = osh.time2str(osh.toc(total_wait))
-        status = f"Pyannote working (time = {tt} / {approximated_waiting_time}) for a sound duration of {dd}. Iteration {counter}/{approximated_number_iterations}."
+        if osh.toc(total_wait) > max_wait_time:
+            osh.error(f"Maximum wait time exceeded while waiting for {remote_json}")
+        status = (
+            f"Pyannote working (time = {tt} / {approximated_waiting_time}) "
+            f"for a sound duration of {dd}. Iteration {counter}/{approximated_number_iterations}."
+        )
         osh.info(status)
         osh.info(f"Waiting for {waiting_time_per_iteration} seconds")
         time.sleep(waiting_time_per_iteration)
@@ -224,18 +273,23 @@ def _poll_for_json_final(
 
 
 def _merge_chunk_results(
-    merged_result_file: str,
+    output_file: str,
     audio_chunks: list,
     analysis_chunks: list,
     sftp_cred: Dict[str, str],
-    pyannote_cred: Dict[str, Any]
+    pyannote_cred: Dict[str, Any],
+    overwrite: bool = True,
+    num_workers: int = 1,
+    silent_time: float = 3.0,            # Configurable silent time
+    max_segment_duration: float = 6.0,   # Configurable max segment duration
+    n_segments_per_speaker: int = 3      # Number of segments per speaker
 ) -> str:
     """
     Merges diarization and confidence score data from multiple chunk results into a single file.
 
     Parameters
     ----------
-    merged_result_file : str
+    output_file : str
         Path to the final merged result file.
     audio_chunks : list
         List of audio chunk file paths.
@@ -245,120 +299,187 @@ def _merge_chunk_results(
         SFTP credentials used for handling files.
     pyannote_cred : dict
         Pyannote credentials used for API access.
+    overwrite : bool, optional
+        Whether to overwrite the output file if it already exists. Defaults to True.
+    num_workers : int, optional
+        Number of workers to use for parallel processing of audio chunks. Defaults to 1.
+    silent_time : float, optional
+        Duration of silence between segments in synthetic audio. Defaults to 3.0 seconds.
+    max_segment_duration : float, optional
+        Maximum duration for a speaker segment in synthetic audio. Defaults to 6.0 seconds.
+    n_segments_per_speaker : int, optional
+        Number of segments to collect per speaker for robustness. Defaults to 3.
 
     Returns
     -------
     str
         Path to the merged result file.
     """
+    # Collect confidences from all chunks
     confidences = []
-    for i, analysis in enumerate(analysis_chunks):
+    for analysis in analysis_chunks:
         with open(analysis, "rt", encoding="utf8") as fin:
             data = json.load(fin)
             confidences += data["output"]["confidence"]["score"]
 
-    original_spk2bit = {}
-    for i, (analysis, audio) in enumerate(zip(analysis_chunks, audio_chunks)):
-        _, b, _ = osh.folder_name_ext(audio)
-        with open(analysis, "rt", encoding="utf8") as fin:
-            diarization_data = json.load(fin)["output"]["diarization"]
+    if osh.file_exists(output_file) and not overwrite:
+        osh.info(f"File {output_file} already exists. Skipping merge.")
+        return output_file
 
-        local_speakers = sorted(list(set(d["speaker"] for d in diarization_data)))
+    folder, sound_basename, _ = osh.folder_name_ext(output_file)
+    synthetic_folder = osh.join(folder, sound_basename, "pyannote")
+    osh.make_directory(synthetic_folder)
 
-        for s in local_speakers:
-            bits = [d for d in diarization_data if d["speaker"] == s]
-            biggest_bit = max(bits, key=lambda x: x["end"] - x["start"])
-            middle = 0.5 * (biggest_bit["start"] + biggest_bit["end"])
-            biggest_bit["start"] = max(biggest_bit["start"], middle - 3)
-            biggest_bit["end"] = min(biggest_bit["end"], middle + 3)
-            speaker_name = f"{b}_{s}"
-            biggest_bit["origin"] = audio
-            biggest_bit["speaker"] = speaker_name
-            original_spk2bit[speaker_name] = biggest_bit
+    # Step 1: Collect multiple segments per speaker across chunks
+    speaker_segments = {}
+    for i, (audio_c, analysis_c) in enumerate(zip(audio_chunks, analysis_chunks)):
+        with open(analysis_c, "rt", encoding="utf8") as fin:
+            chunk_results = json.load(fin)
+            chunk_results = chunk_results["output"]["diarization"]
+            for chunk_segment in chunk_results:
+                name = f"{i}_{chunk_segment['speaker']}"
+                start, end = chunk_segment["start"], chunk_segment["end"]
+                duration = end - start
 
-    time_cursor = 0
-    list_of_audio_bits = []
-    f, _, _ = osh.folder_name_ext(audio_chunks[0])
-    concatenated_audio = osh.join(f, "concatenated.mp3")
-    bit_counter = 0
+                # Adjust segment to be within max_segment_duration
+                middle = 0.5 * (start + end)
+                start = max(start, middle - 0.5 * max_segment_duration)
+                end = min(end, middle + 0.5 * max_segment_duration)
+                duration = end - start
+
+                # Store segments per speaker
+                if name not in speaker_segments:
+                    speaker_segments[name] = []
+                speaker_segments[name].append((duration, start, end, audio_c))
+
+    # Keep top n_segments_per_speaker segments per speaker
+    for name in speaker_segments:
+        segments = speaker_segments[name]
+        # Sort segments by duration in descending order
+        segments.sort(key=lambda seg: seg[0], reverse=True)
+        # Keep only the top N segments
+        num_segments = min(n_segments_per_speaker, len(segments))
+        speaker_segments[name] = segments[:num_segments]
+
+    # Step 2: Create synthetic audio with multiple segments per speaker
+    synthetic_audio_segments = []
     synthetic_diarization = []
+    time_cursor = 0.0
+    for i, (name, segments) in enumerate(speaker_segments.items()):
+        for j, (duration, start, end, audio_c) in enumerate(segments):
+            segment_path = f"{synthetic_folder}/synthetic_segment_{i}_{j}.mp3"
+            ah.extract_audio_chunk(audio_c, start, end, segment_path, overwrite=True)
+            synthetic_audio_segments.append(segment_path)
+            synthetic_diarization.append({
+                "start": time_cursor,
+                "end": time_cursor + (end - start),
+                "speaker": name,
+                "word": segment_path
+            })
+            time_cursor += (end - start)
 
-    for i, speaker_name in enumerate(original_spk2bit):
-        bit = original_spk2bit[speaker_name]
-        new_audio_chunk = f"{f}/bit_{bit_counter:04d}.mp3"
-        audio_bit = ah.extract_audio_chunk(
-            bit["origin"], bit["start"], bit["end"], new_audio_chunk, overwrite=True
-        )
-        list_of_audio_bits.append(audio_bit)
-        duration = bit["end"] - bit["start"]
-        bit["start"] = time_cursor
-        bit["end"] = time_cursor + duration
-        synthetic_diarization.append(bit)
+            # Add silent segment for separation
+            silence_path = f"{synthetic_folder}/silence_{i}_{j}.mp3"
+            ah.generate_silent_audio(silent_time, output_audio_filename=silence_path)
+            synthetic_audio_segments.append(silence_path)
+            time_cursor += silent_time
+
+    synthetic_diarization = sorted(synthetic_diarization, key=lambda x: x["start"])
+
+    # Concatenate all segments into one synthetic audio file
+    synthetic_audio = f"{synthetic_folder}/synthetic_audio.mp3"
+    osh.info(f"Concatenating synthetic audio segments to {synthetic_audio}")
+    ah.audio_concatenation(synthetic_audio_segments, synthetic_audio, overwrite=True)
+
+    # Step 3: Process the synthetic audio to get consistent speaker labels
+    synthetic_output_file = f"{synthetic_folder}/synthetic_output.json"
+    pyannote_processing(
+        synthetic_audio,
+        sftp_cred,
+        pyannote_cred,
+        output_file=synthetic_output_file,
+        num_workers=1,
+        overwrite=overwrite
+    )
+
+    with open(synthetic_output_file, "rt", encoding="utf8") as fin:
+        synthetic_results = json.load(fin)
+        synthetic_results = synthetic_results["output"]["diarization"]
+        for s in synthetic_results:
+            s["speaker"] = str(s["speaker"])
+        synthetic_results = sorted(synthetic_results, key=lambda x: x["start"])
+
+    # Map initial speaker names to synthetic speakers based on maximum overlap
+    initial_to_synthetic_names = {}
+    for sd in synthetic_diarization:
+        sd_start, sd_end = sd["start"], sd["end"]
+        overlaps = {}
+        for sr in synthetic_results:
+            sr_start, sr_end = sr["start"], sr["end"]
+            intersection = max(0, min(sd_end, sr_end) - max(sd_start, sr_start))
+            if intersection > 0:
+                overlaps[sr["speaker"]] = overlaps.get(sr["speaker"], 0) + intersection
+
+        if overlaps:
+            # Assign to the synthetic speaker with the maximum overlap
+            best_match = max(overlaps, key=overlaps.get)
+            initial_to_synthetic_names[sd["speaker"]] = best_match
+        else:
+            osh.warning(f"No overlap found for speaker {sd['speaker']}")
+            initial_to_synthetic_names[sd["speaker"]] = sd["speaker"]  # Keep original
+
+    # Step 4: Adjust original chunks with new speaker mappings and save merged output
+    res = []
+    time_cursor = 0.0
+    for i, (audio_chunk, analysis_chunk) in enumerate(zip(audio_chunks, analysis_chunks)):
+        duration = ah.get_audio_duration(audio_chunk)
+        with open(analysis_chunk, "rt", encoding="utf8") as fin:
+            chunk_results = json.load(fin)
+            chunk_diarization = chunk_results["output"]["diarization"]
+            for sentence in chunk_diarization:
+                original_name = f"{i}_{sentence['speaker']}"
+                if original_name in initial_to_synthetic_names:
+                    sentence["speaker"] = initial_to_synthetic_names[original_name]
+                else:
+                    osh.warning(f"Speaker {original_name} not found in mapping.")
+                    sentence["speaker"] = sentence["speaker"]  # Keep original
+                # Adjust timings for the overall timeline
+                sentence["start"] += time_cursor
+                sentence["end"] += time_cursor
+                res.append(sentence)
         time_cursor += duration
-        bit_counter += 1
 
-        silence_chunk = f"{f}/bit_{bit_counter:04d}.mp3"
-        silence_duration = 1.0
-        silence = ah.generate_silent_audio(silence_duration, silence_chunk, overwrite=True)
-        list_of_audio_bits.append(silence)
-        time_cursor += silence_duration
-        bit_counter += 1
+    res = sorted(res, key=lambda x: x["start"])
 
-    synthetic_audio = ah.audio_concatenation(list_of_audio_bits, concatenated_audio, overwrite=True)
+    # Adjust confidence scores length to match diarization results
+    if len(confidences) != len(res):
+        osh.warning("Mismatch between number of confidence scores and diarization segments.")
+        # Adjust accordingly, e.g., truncate or pad with average confidence
+        avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+        if len(confidences) > len(res):
+            confidences = confidences[:len(res)]
+        else:
+            confidences += [avg_confidence] * (len(res) - len(confidences))
 
-    synthetic_audio_duration = ah.get_audio_duration(synthetic_audio)
-    if synthetic_audio_duration > 2 * 60 * 60:
-        tt = osh.time2str(synthetic_audio_duration)
-        osh.error(f"Synthetic audio exceeds the 2-hour processing limit for Pyannote {tt}:\n\t{synthetic_audio}")
+    # Use template from the first chunk
+    with open(analysis_chunks[0], "rt", encoding="utf8") as fin:
+        template = json.load(fin)
 
-    output_file = pyannote_processing(synthetic_audio, sftp_cred, pyannote_cred)
+    final_output = {
+        "jobId": template.get("jobId", ""),
+        "status": template.get("status", "done"),
+        "output": {
+            "diarization": res,
+            "confidence": {
+                "score": confidences,
+                "resolution": template["output"]["confidence"].get("resolution", 0.02)
+            }
+        }
+    }
 
-    with open(output_file, "rt", encoding="utf8") as fin:
-        synthetic_analysis = json.load(fin)
+    # Save final merged results
+    with open(output_file, "wt", encoding="utf8") as fout:
+        json.dump(final_output, fout, indent=2)
+    osh.info(f"Saved merged results to:\n\t{output_file}")
 
-    synthetic_speakers = sorted(set(d["speaker"] for d in synthetic_analysis["output"]["diarization"]))
-    original_speakers = sorted(original_spk2bit.keys())
-
-    R, C = len(original_speakers), len(synthetic_speakers)
-    M = np.zeros((R, C))
-
-    for i, s_original in enumerate(original_speakers):
-        original_bit = original_spk2bit[s_original]
-        for j, s_synthetic in enumerate(synthetic_speakers):
-            synthetic_bits = [d for d in synthetic_analysis["output"]["diarization"] if d["speaker"] == s_synthetic]
-            for sb in synthetic_bits:
-                intersection = max(0, min(sb["end"], original_bit["end"]) - max(sb["start"], original_bit["start"]))
-                M[i, j] += intersection / (original_bit["end"] - original_bit["start"])
-
-    osh.check(np.sum(M.ravel()) > 0, "No overlap found between original and synthetic speakers")
-
-    original2synthetic = {}
-    for i, s_original in enumerate(original_speakers):
-        j = np.argmax(M[i, :])
-        original2synthetic[s_original] = synthetic_speakers[j]
-
-    time_cursor = 0
-    merged_diarization = []
-    resolution = None
-    for i, (analysis, audio) in enumerate(zip(analysis_chunks, audio_chunks)):
-        _, b, _ = osh.folder_name_ext(audio)
-        with open(analysis, "rt", encoding="utf8") as fin:
-            d = json.load(fin)
-            chunk_diarization = d["output"]["diarization"]
-            resolution = d["output"]["confidence"]["resolution"]
-
-        for entry in chunk_diarization:
-            original_speaker = f"{b}_{entry['speaker']}"
-            entry["speaker"] = original2synthetic.get(original_speaker, original_speaker)
-            entry["start"] += time_cursor
-            entry["end"] += time_cursor
-
-        merged_diarization.extend(chunk_diarization)
-
-        time_cursor += ah.get_audio_duration(audio)
-
-    final_result = {"output": {"diarization": merged_diarization, "confidence": {"score": confidences, "resolution": resolution}}}
-    with open(merged_result_file, "wt", encoding="utf8") as fout:
-        json.dump(final_result, fout, indent=2)
-
-    return merged_result_file
+    return output_file
