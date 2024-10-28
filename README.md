@@ -1,6 +1,5 @@
-# Diarization Engine
-
-The Diariazation engine combines gladia and pyannote to perform state of the art diarization based on sound.
+# heedgitv-4loran
+This Diariazation engine combines gladia and pyannote to perform state of the art diarization based on sound.
 
 [![logo](logo.png)](https://harchaoui.org/warith/ai-helpers)
 
@@ -47,7 +46,7 @@ sudo apt install ffmpeg
 ```bash
 # activate your python environment
 conda activate env4dzh
-pip install --force-reinstall --no-cache-dir git+https://github.com/warith-harchaoui/diarization-helper.git@main
+pip install --force-reinstall --no-cache-dir git+https://github.com/warith-harchaoui/heedgitv-4loran.git@main
 ```
 
 # Usage
