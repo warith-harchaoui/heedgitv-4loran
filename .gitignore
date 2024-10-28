@@ -26,7 +26,8 @@ logs/
 *.rm
 *.asf
 
-
+.DS_Store
+*/.DS_Store
 
 # Audio tests
 audio_tests/
